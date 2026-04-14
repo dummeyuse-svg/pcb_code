@@ -1,0 +1,263 @@
+import cv2
+import numpy as np
+import time
+import os
+from tkinter import Tk, filedialog
+
+# ---------------------------
+# CONFIGURATION
+# ---------------------------
+
+EXPECTED_HOLES = 6
+
+# 🔥 FINAL TUNED PARAMETERS
+ROI_SIZE = 22
+DARK_PIXEL_THRESHOLD = 100
+DARK_RATIO_THRESHOLD = 0.05
+
+SAVE_DIR = "captured_frames"
+SAVE_ONLY_ON_ERROR = False
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ---------------------------
+# 🔥 CALIBRATED POSITIONS (FINAL)
+# ---------------------------
+
+EXPECTED_POSITIONS = [
+    (20, 20),        # top-left
+    (137, 20),       # top-middle
+    (290, 20),       # top-right
+    (20, 135),       # bottom-left
+    (159, 135),      # bottom-middle
+    (290, 135)       # bottom-right
+]
+
+# ---------------------------
+# ROI DETECTION (FINAL FIXED)
+# ---------------------------
+
+def check_holes_roi(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    matched = 0
+
+    h, w = gray.shape
+
+    for idx, (x, y) in enumerate(EXPECTED_POSITIONS):
+
+        # 🔥 SAFE ROI BOUNDS (CRITICAL)
+        x1 = max(0, x - ROI_SIZE)
+        y1 = max(0, y - ROI_SIZE)
+        x2 = min(w, x + ROI_SIZE)
+        y2 = min(h, y + ROI_SIZE)
+
+        roi_full = gray[y1:y2, x1:x2]
+
+        if roi_full.size == 0:
+            continue
+
+        # 🔥 CENTER ROI (KEY FIX)
+        h_roi, w_roi = roi_full.shape
+
+        cx1 = int(w_roi * 0.3)
+        cy1 = int(h_roi * 0.3)
+        cx2 = int(w_roi * 0.7)
+        cy2 = int(h_roi * 0.7)
+
+        roi = roi_full[cy1:cy2, cx1:cx2]
+
+        # 🔥 DARK PIXEL DETECTION
+        dark_pixels = np.sum(roi < DARK_PIXEL_THRESHOLD)
+        total_pixels = roi.size
+        dark_ratio = dark_pixels / total_pixels
+
+        # Decision
+        if dark_ratio > DARK_RATIO_THRESHOLD:
+            matched += 1
+            color = (0, 255, 255)  # 🟡 OK
+            label = "OK"
+        else:
+            color = (0, 0, 255)    # 🔴 MISS
+            label = "MISS"
+
+        # Draw ROI
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        # Label
+        cv2.putText(frame, f"{idx+1}:{label}",
+                    (x1, y2 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1)
+
+        # Debug value
+        cv2.putText(frame, f"{dark_ratio:.2f}",
+                    (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    color,
+                    1)
+
+    return matched, frame
+
+
+# ---------------------------
+# LOG ERROR
+# ---------------------------
+
+def log_error(message):
+    with open("error_log.txt", "a") as f:
+        f.write(f"{time.ctime()} - {message}\n")
+    print("ERROR:", message)
+
+
+# ---------------------------
+# SAVE IMAGE
+# ---------------------------
+
+def save_frame(original, processed, status, matched_count):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    raw_path = os.path.join(SAVE_DIR, f"{timestamp}_raw.jpg")
+    processed_path = os.path.join(
+        SAVE_DIR,
+        f"{timestamp}_{status}_{matched_count}of6.jpg"
+    )
+
+    cv2.imwrite(raw_path, original)
+    cv2.imwrite(processed_path, processed)
+
+    print(f"[SAVED] {processed_path}")
+
+
+# ---------------------------
+# TEST ON IMAGE
+# ---------------------------
+
+def test_on_image(image_path):
+    frame = cv2.imread(image_path)
+
+    if frame is None:
+        print("❌ Could not load image")
+        return
+
+    original_frame = frame.copy()
+
+    matched_count, output = check_holes_roi(frame)
+
+    if matched_count == EXPECTED_HOLES:
+        status = "OK"
+        color = (0, 255, 0)
+    else:
+        status = "ERROR"
+        color = (0, 0, 255)
+        log_error(f"[TEST IMAGE] Holes detected: {matched_count}/6")
+
+    cv2.putText(output, f"Status: {status}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                color,
+                2)
+
+    cv2.putText(output, f"Matched: {matched_count}/6",
+                (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2)
+
+    save_frame(original_frame, output, status, matched_count)
+
+    cv2.imshow("ROI Detection", output)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+# ---------------------------
+# FILE PICKER
+# ---------------------------
+
+def pick_image():
+    Tk().withdraw()
+    return filedialog.askopenfilename()
+
+
+# ---------------------------
+# CAMERA MODE
+# ---------------------------
+
+def run_camera():
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Camera not accessible")
+        return
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        original_frame = frame.copy()
+
+        matched_count, output = check_holes_roi(frame)
+
+        if matched_count == EXPECTED_HOLES:
+            status = "OK"
+            color = (0, 255, 0)
+        else:
+            status = "ERROR"
+            color = (0, 0, 255)
+            log_error(f"Holes detected: {matched_count}/6")
+
+        cv2.putText(output, f"Status: {status}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    color,
+                    2)
+
+        cv2.putText(output, f"Matched: {matched_count}/6",
+                    (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2)
+
+        if not SAVE_ONLY_ON_ERROR or status == "ERROR":
+            save_frame(original_frame, output, status, matched_count)
+
+        cv2.imshow("PCB ROI Inspection", output)
+
+        if cv2.waitKey(1) == 27:
+            break
+
+        time.sleep(1)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# ---------------------------
+# MAIN
+# ---------------------------
+
+if __name__ == "__main__":
+
+    print("Select Mode:")
+    print("1 → Test on Image")
+    print("2 → Run Camera")
+
+    choice = input("Enter choice (1/2): ")
+
+    if choice == "1":
+        path = pick_image()
+        test_on_image(path)
+
+    elif choice == "2":
+        run_camera()
+
+    else:
+        print("Invalid choice")
