@@ -1,0 +1,179 @@
+import cv2
+import numpy as np
+import time
+import os
+
+# ---------------------------
+# CONFIGURATION
+# ---------------------------
+
+EXPECTED_HOLES = 6
+
+EXPECTED_POSITIONS = [
+    (100, 100),
+    (400, 100),
+    (100, 300),
+    (400, 300),
+    (100, 500),
+    (400, 500)
+]
+
+POSITION_TOLERANCE = 40
+MIN_RADIUS = 5
+MAX_RADIUS = 30
+
+# 🔥 NEW: Image save settings
+SAVE_DIR = "captured_frames"
+SAVE_ONLY_ON_ERROR = False   # True → saves only error images
+
+# Create directory if not exists
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ---------------------------
+# FUNCTION: Detect Holes
+# ---------------------------
+
+def detect_holes(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (9, 9), 1.5)
+
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=50,
+        param1=100,
+        param2=20,
+        minRadius=MIN_RADIUS,
+        maxRadius=MAX_RADIUS
+    )
+
+    detected_centers = []
+
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype("int")
+        for (x, y, r) in circles:
+            detected_centers.append((x, y))
+
+            # GREEN → detected hole
+            cv2.circle(frame, (x, y), r, (0, 255, 0), 2)
+            cv2.circle(frame, (x, y), 3, (0, 0, 255), -1)
+
+    return detected_centers, frame
+
+
+# ---------------------------
+# FUNCTION: Match Holes
+# ---------------------------
+
+def match_holes(detected):
+    matched = 0
+
+    for ex in EXPECTED_POSITIONS:
+        for d in detected:
+            dist = np.linalg.norm(np.array(ex) - np.array(d))
+            if dist < POSITION_TOLERANCE:
+                matched += 1
+                break
+
+    return matched
+
+
+# ---------------------------
+# FUNCTION: Log Error
+# ---------------------------
+
+def log_error(message):
+    with open("error_log.txt", "a") as f:
+        f.write(f"{time.ctime()} - {message}\n")
+    print("ERROR:", message)
+
+
+# ---------------------------
+# FUNCTION: Save Image
+# ---------------------------
+
+def save_frame(original, processed, status, matched_count):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    raw_path = os.path.join(SAVE_DIR, f"{timestamp}_raw.jpg")
+    processed_path = os.path.join(
+        SAVE_DIR,
+        f"{timestamp}_{status}_{matched_count}of6.jpg"
+    )
+
+    cv2.imwrite(raw_path, original)
+    cv2.imwrite(processed_path, processed)
+
+    print(f"[SAVED] {processed_path}")
+
+
+# ---------------------------
+# MAIN LOOP
+# ---------------------------
+
+def main():
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Camera not accessible")
+        return
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        original_frame = frame.copy()
+
+        detected, output = detect_holes(frame)
+        matched_count = match_holes(detected)
+
+        # Draw expected positions (BLUE)
+        for (x, y) in EXPECTED_POSITIONS:
+            cv2.circle(output, (x, y), 10, (255, 0, 0), 2)
+
+        # Decision logic
+        if matched_count == EXPECTED_HOLES:
+            status = "OK"
+            color = (0, 255, 0)
+        else:
+            status = "ERROR"
+            color = (0, 0, 255)
+            log_error(f"Holes detected: {matched_count}/6")
+
+        # Display text info
+        cv2.putText(output, f"Status: {status}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    color,
+                    2)
+
+        cv2.putText(output, f"Detected: {matched_count}/6",
+                    (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2)
+
+        # 🔥 SAVE IMAGE (KEY FEATURE)
+        if not SAVE_ONLY_ON_ERROR or status == "ERROR":
+            save_frame(original_frame, output, status, matched_count)
+
+        cv2.imshow("PCB Inspection", output)
+
+        key = cv2.waitKey(1)
+
+        if key == 27:  # ESC
+            break
+
+        # Optional: capture only every 1 sec (avoid spam)
+        time.sleep(1)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
