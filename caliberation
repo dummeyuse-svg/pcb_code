@@ -1,0 +1,277 @@
+import cv2
+import numpy as np
+import time
+import os
+from tkinter import Tk, filedialog
+
+# ---------------------------
+# CONFIGURATION
+# ---------------------------
+
+EXPECTED_HOLES = 6
+
+ROI_SIZE = 22
+DARK_PIXEL_THRESHOLD = 100
+DARK_RATIO_THRESHOLD = 0.05
+
+SAVE_DIR = "captured_frames"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ---------------------------
+# GLOBAL STORAGE
+# ---------------------------
+
+EXPECTED_POSITIONS = []
+clicked_points = []
+
+# ---------------------------
+# MOUSE CALLBACK
+# ---------------------------
+
+def mouse_callback(event, x, y, flags, param):
+    global clicked_points
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if len(clicked_points) < 6:
+            clicked_points.append((x, y))
+            print(f"Point {len(clicked_points)}:", (x, y))
+
+
+# ---------------------------
+# CALIBRATION (IMAGE)
+# ---------------------------
+
+def calibrate_from_image(image_path):
+    global clicked_points
+    clicked_points = []
+
+    frame = cv2.imread(image_path)
+    clone = frame.copy()
+
+    cv2.namedWindow("Calibration")
+    cv2.setMouseCallback("Calibration", mouse_callback)
+
+    print("\n👉 Click 6 holes (Top L → Bottom R)\n")
+
+    while True:
+        temp = clone.copy()
+
+        for i, (x, y) in enumerate(clicked_points):
+            cv2.circle(temp, (x, y), 6, (0, 255, 255), -1)
+            cv2.putText(temp, str(i+1), (x+5, y-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+
+        cv2.imshow("Calibration", temp)
+
+        if cv2.waitKey(1) == 27:
+            break
+
+    cv2.destroyAllWindows()
+
+    print("\n✅ COPY THIS:\n")
+    print("EXPECTED_POSITIONS = [")
+    for p in clicked_points:
+        print(f"    {p},")
+    print("]")
+
+
+# ---------------------------
+# CALIBRATION (CAMERA)
+# ---------------------------
+
+def calibrate_from_camera():
+    global clicked_points
+    clicked_points = []
+
+    cap = cv2.VideoCapture(0)
+
+    print("\n🎥 Press 'c' to capture frame")
+
+    while True:
+        ret, frame = cap.read()
+        cv2.imshow("Live Camera", frame)
+
+        key = cv2.waitKey(1)
+
+        if key == ord('c'):
+            captured = frame.copy()
+            break
+        elif key == 27:
+            cap.release()
+            cv2.destroyAllWindows()
+            return
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    clone = captured.copy()
+    cv2.namedWindow("Calibration")
+    cv2.setMouseCallback("Calibration", mouse_callback)
+
+    print("\n👉 Click 6 holes\n")
+
+    while True:
+        temp = clone.copy()
+
+        for i, (x, y) in enumerate(clicked_points):
+            cv2.circle(temp, (x, y), 6, (0, 255, 255), -1)
+            cv2.putText(temp, str(i+1), (x+5, y-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+
+        cv2.imshow("Calibration", temp)
+
+        if cv2.waitKey(1) == 27:
+            break
+
+    cv2.destroyAllWindows()
+
+    print("\n✅ COPY THIS:\n")
+    print("EXPECTED_POSITIONS = [")
+    for p in clicked_points:
+        print(f"    {p},")
+    print("]")
+
+
+# ---------------------------
+# ROI DETECTION
+# ---------------------------
+
+def check_holes_roi(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    matched = 0
+
+    h, w = gray.shape
+
+    for idx, (x, y) in enumerate(EXPECTED_POSITIONS):
+
+        x1 = max(0, x - ROI_SIZE)
+        y1 = max(0, y - ROI_SIZE)
+        x2 = min(w, x + ROI_SIZE)
+        y2 = min(h, y + ROI_SIZE)
+
+        roi_full = gray[y1:y2, x1:x2]
+
+        if roi_full.size == 0:
+            continue
+
+        # Center ROI
+        h_roi, w_roi = roi_full.shape
+
+        cx1 = int(w_roi * 0.3)
+        cy1 = int(h_roi * 0.3)
+        cx2 = int(w_roi * 0.7)
+        cy2 = int(h_roi * 0.7)
+
+        roi = roi_full[cy1:cy2, cx1:cx2]
+
+        dark_pixels = np.sum(roi < DARK_PIXEL_THRESHOLD)
+        total_pixels = roi.size
+        dark_ratio = dark_pixels / total_pixels
+
+        if dark_ratio > DARK_RATIO_THRESHOLD:
+            matched += 1
+            color = (0, 255, 255)
+            label = "OK"
+        else:
+            color = (0, 0, 255)
+            label = "MISS"
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        cv2.putText(frame, f"{idx+1}:{label}",
+                    (x1, y2 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1)
+
+    return matched, frame
+
+
+# ---------------------------
+# TEST IMAGE
+# ---------------------------
+
+def test_on_image(path):
+    frame = cv2.imread(path)
+    matched, output = check_holes_roi(frame)
+
+    cv2.putText(output, f"Matched: {matched}/6",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0,255,0) if matched==6 else (0,0,255),
+                2)
+
+    cv2.imshow("Result", output)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+# ---------------------------
+# CAMERA MODE
+# ---------------------------
+
+def run_camera():
+    cap = cv2.VideoCapture(0)
+
+    while True:
+        ret, frame = cap.read()
+        matched, output = check_holes_roi(frame)
+
+        cv2.putText(output, f"Matched: {matched}/6",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0,255,0) if matched==6 else (0,0,255),
+                    2)
+
+        cv2.imshow("Live Detection", output)
+
+        if cv2.waitKey(1) == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# ---------------------------
+# FILE PICKER
+# ---------------------------
+
+def pick_image():
+    Tk().withdraw()
+    return filedialog.askopenfilename()
+
+
+# ---------------------------
+# MAIN
+# ---------------------------
+
+if __name__ == "__main__":
+
+    print("\nSelect Mode:")
+    print("1 → Calibrate from Image")
+    print("2 → Test on Image")
+    print("3 → Run Camera")
+    print("4 → Calibrate from Camera")
+
+    choice = input("Enter choice: ")
+
+    if choice == "1":
+        calibrate_from_image(pick_image())
+
+    elif choice == "2":
+        test_on_image(pick_image())
+
+    elif choice == "3":
+        if not EXPECTED_POSITIONS:
+            print("⚠️ Please calibrate first!")
+        else:
+            run_camera()
+
+    elif choice == "4":
+        calibrate_from_camera()
+
+    else:
+        print("Invalid choice")
