@@ -1,0 +1,374 @@
+import cv2
+import numpy as np
+import time
+import os
+from tkinter import Tk, filedialog
+
+# ---------------------------
+# CONFIGURATION
+# ---------------------------
+
+EXPECTED_HOLES = 6
+ROI_SIZE = 22          # Full ROI box around each hole
+CENTER_CROP = 0.5      # Use center 50% of ROI for analysis (tighter focus)
+
+SAVE_DIR = "captured_frames"
+SAVE_ONLY_ON_ERROR = False
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ---------------------------
+# CALIBRATED POSITIONS
+# ---------------------------
+
+EXPECTED_POSITIONS = [
+    (29, 34),
+    (186, 38),
+    (333, 36),
+    (21, 93),
+    (187, 92),
+    (338, 89)
+]
+
+# ---------------------------
+# THRESHOLDS — TUNE THESE
+# ---------------------------
+# Run in CALIBRATION MODE first to find correct values for your setup.
+# These are starting points only.
+
+PIN_MEAN_MIN       = 130   # Metal pin reflects light → higher brightness
+DARK_RATIO_MAX     = 0.20  # Empty holes have MORE dark pixels
+EDGE_MEAN_MIN      = 15    # Pin inside hole creates internal edges/texture
+
+# ---------------------------
+# FEATURE EXTRACTION
+# ---------------------------
+
+def extract_roi_features(gray, x, y):
+    """
+    Extracts a tight center ROI around (x, y) and computes features.
+    Returns: (mean, std, dark_ratio, edge_mean, roi_center)
+    """
+    h, w = gray.shape
+
+    # Full bounding box
+    x1 = max(0, x - ROI_SIZE)
+    y1 = max(0, y - ROI_SIZE)
+    x2 = min(w, x + ROI_SIZE)
+    y2 = min(h, y + ROI_SIZE)
+
+    roi_full = gray[y1:y2, x1:x2]
+    if roi_full.size == 0:
+        return None
+
+    # Tighter center crop
+    h_roi, w_roi = roi_full.shape
+    margin_x = int(w_roi * (1 - CENTER_CROP) / 2)
+    margin_y = int(h_roi * (1 - CENTER_CROP) / 2)
+    roi = roi_full[margin_y:h_roi - margin_y, margin_x:w_roi - margin_x]
+
+    if roi.size == 0:
+        return None
+
+    # --- Feature 1: Mean brightness ---
+    # Pin (metal) → reflects light → higher mean
+    # Empty hole  → absorbs light  → lower mean
+    mean_val = float(np.mean(roi))
+
+    # --- Feature 2: Standard deviation ---
+    # Useful as a secondary check; pins may have texture
+    std_val = float(np.std(roi))
+
+    # --- Feature 3: Dark pixel ratio ---
+    # Empty holes → more pixels below dark threshold
+    dark_pixels = np.sum(roi < 80)
+    dark_ratio = dark_pixels / roi.size
+
+    # --- Feature 4: Edge (Laplacian) mean ---
+    # Pin inserted → creates internal circular structure → higher edge response
+    # Empty hole  → mostly uniform dark → low edge response inside
+    laplacian = cv2.Laplacian(roi, cv2.CV_64F)
+    edge_mean = float(np.mean(np.abs(laplacian)))
+
+    return mean_val, std_val, dark_ratio, edge_mean, roi, (x1, y1, x2, y2)
+
+
+# ---------------------------
+# PIN DECISION LOGIC
+# ---------------------------
+
+def is_pin_present(mean_val, dark_ratio, edge_mean):
+    """
+    Returns True if a pin is detected.
+
+    Logic:
+      - PIN:   bright center (high mean) OR low dark ratio OR has internal texture (edges)
+      - EMPTY: dark center (low mean) AND high dark ratio AND no internal edges
+
+    Using a VOTING system for robustness — 2 out of 3 features must agree.
+    """
+    votes_for_pin = 0
+
+    # Vote 1: Brightness check
+    if mean_val >= PIN_MEAN_MIN:
+        votes_for_pin += 1
+
+    # Vote 2: Dark pixel ratio check
+    if dark_ratio <= DARK_RATIO_MAX:
+        votes_for_pin += 1
+
+    # Vote 3: Edge/texture inside hole
+    if edge_mean >= EDGE_MEAN_MIN:
+        votes_for_pin += 1
+
+    # Majority vote: 2 or more → PIN present
+    return votes_for_pin >= 2, votes_for_pin
+
+
+# ---------------------------
+# MAIN INSPECTION FUNCTION
+# ---------------------------
+
+def check_pins_roi(frame, calibration_mode=False):
+    """
+    Detects pins in all 6 holes.
+    If calibration_mode=True, prints detailed feature values for threshold tuning.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Optional: Apply slight blur to reduce noise
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    pin_count = 0
+    results = []
+
+    for idx, (x, y) in enumerate(EXPECTED_POSITIONS):
+        result = extract_roi_features(gray, x, y)
+
+        if result is None:
+            print(f"Hole {idx+1}: ⚠️  ROI out of bounds, skipping")
+            continue
+
+        mean_val, std_val, dark_ratio, edge_mean, roi, (x1, y1, x2, y2) = result
+
+        pin_detected, vote_count = is_pin_present(mean_val, dark_ratio, edge_mean)
+
+        if calibration_mode:
+            # Print all values so you can tune thresholds
+            print(
+                f"Hole {idx+1}: "
+                f"Mean={mean_val:6.1f} | "
+                f"Std={std_val:5.1f} | "
+                f"DarkRatio={dark_ratio:.3f} | "
+                f"EdgeMean={edge_mean:5.1f} | "
+                f"Votes={vote_count}/3 → {'PIN ✅' if pin_detected else 'EMPTY ❌'}"
+            )
+
+        if pin_detected:
+            label = "PIN"
+            color = (0, 255, 0)   # Green = good
+            pin_count += 1
+        else:
+            label = "EMPTY"
+            color = (0, 0, 255)   # Red = missing pin
+
+        results.append((idx+1, label, pin_detected))
+
+        # Draw ROI box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        # Draw crosshair at expected center
+        cv2.drawMarker(frame, (x, y), color,
+                       markerType=cv2.MARKER_CROSS,
+                       markerSize=8, thickness=1)
+
+        # Label: hole number + status
+        cv2.putText(frame,
+                    f"H{idx+1}:{label}",
+                    (x1, y2 + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, color, 1)
+
+        # Debug values above box
+        cv2.putText(frame,
+                    f"M:{mean_val:.0f} D:{dark_ratio:.2f} E:{edge_mean:.1f}",
+                    (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35, color, 1)
+
+    return pin_count, frame, results
+
+
+# ---------------------------
+# LOG ERROR
+# ---------------------------
+
+def log_error(message):
+    with open("error_log.txt", "a") as f:
+        f.write(f"{time.ctime()} - {message}\n")
+    print("ERROR:", message)
+
+
+# ---------------------------
+# SAVE IMAGE
+# ---------------------------
+
+def save_frame(original, processed, status, pin_count):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    raw_path = os.path.join(SAVE_DIR, f"{timestamp}_raw.jpg")
+    processed_path = os.path.join(SAVE_DIR, f"{timestamp}_{status}_{pin_count}of6.jpg")
+    cv2.imwrite(raw_path, original)
+    cv2.imwrite(processed_path, processed)
+    print(f"[SAVED] {processed_path}")
+
+
+# ---------------------------
+# DRAW FINAL STATUS OVERLAY
+# ---------------------------
+
+def draw_status(frame, pin_count, status, color):
+    # Semi-transparent status bar at top
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 55), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+    cv2.putText(frame,
+                f"Status: {status}   Pins: {pin_count}/{EXPECTED_HOLES}",
+                (10, 38),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9, color, 2)
+    return frame
+
+
+# ---------------------------
+# TEST ON IMAGE
+# ---------------------------
+
+def test_on_image(image_path, calibration_mode=False):
+    frame = cv2.imread(image_path)
+    if frame is None:
+        print("❌ Could not load image:", image_path)
+        return
+
+    original_frame = frame.copy()
+
+    pin_count, output, results = check_pins_roi(frame, calibration_mode=calibration_mode)
+
+    if pin_count == EXPECTED_HOLES:
+        status = "OK"
+        color = (0, 255, 0)
+    else:
+        status = "ERROR"
+        color = (0, 0, 255)
+        missing = [str(r[0]) for r in results if not r[2]]
+        log_error(f"[IMAGE] Pins: {pin_count}/6. Missing at holes: {', '.join(missing)}")
+
+    output = draw_status(output, pin_count, status, color)
+
+    save_frame(original_frame, output, status, pin_count)
+
+    cv2.imshow("PCB Pin Inspection", output)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+# ---------------------------
+# FILE PICKER
+# ---------------------------
+
+def pick_image():
+    Tk().withdraw()
+    return filedialog.askopenfilename(
+        title="Select PCB Image",
+        filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")]
+    )
+
+
+# ---------------------------
+# CAMERA MODE
+# ---------------------------
+
+def run_camera(calibration_mode=False):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Camera not accessible")
+        return
+
+    print("Camera running. Press ESC to quit, 'c' to toggle calibration mode.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        original_frame = frame.copy()
+
+        pin_count, output, results = check_pins_roi(frame, calibration_mode=calibration_mode)
+
+        if pin_count == EXPECTED_HOLES:
+            status = "OK"
+            color = (0, 255, 0)
+        else:
+            status = "ERROR"
+            color = (0, 0, 255)
+            missing = [str(r[0]) for r in results if not r[2]]
+            log_error(f"Pins: {pin_count}/6. Missing at holes: {', '.join(missing)}")
+
+        output = draw_status(output, pin_count, status, color)
+
+        if not SAVE_ONLY_ON_ERROR or status == "ERROR":
+            save_frame(original_frame, output, status, pin_count)
+
+        cv2.imshow("PCB Pin Inspection", output)
+
+        key = cv2.waitKey(1)
+        if key == 27:   # ESC
+            break
+        elif key == ord('c'):
+            calibration_mode = not calibration_mode
+            print(f"Calibration mode: {'ON' if calibration_mode else 'OFF'}")
+
+        time.sleep(0.5)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# ---------------------------
+# MAIN
+# ---------------------------
+
+if __name__ == "__main__":
+    print("\n=== PCB Pin Inspection System ===")
+    print("1 → Test on Image (Normal)")
+    print("2 → Test on Image (Calibration Mode — prints all feature values)")
+    print("3 → Run Camera (Normal)")
+    print("4 → Run Camera (Calibration Mode)")
+
+    choice = input("\nEnter choice (1/2/3/4): ").strip()
+
+    if choice in ("1", "2"):
+        path = pick_image()
+        if path:
+            test_on_image(path, calibration_mode=(choice == "2"))
+        else:
+            print("No image selected.")
+
+    elif choice in ("3", "4"):
+        run_camera(calibration_mode=(choice == "4"))
+
+    else:
+        print("Invalid choice")
+
+
+Since you have a fixed camera + fixed jig, do this once:
+Step 1 — Run mode 2 (Calibration) with an image where all 6 pins are inserted. Note down the Mean, DarkRatio, and EdgeMean values for each hole.
+Step 2 — Run mode 2 with an image where some pins are missing. Note the values for empty holes.
+Step 3 — Set your thresholds in between:
+python# Example — if pin gives Mean~160, empty gives Mean~70:
+PIN_MEAN_MIN    = 115   # midpoint
+
+# If pin gives DarkRatio~0.05, empty gives DarkRatio~0.45:
+DARK_RATIO_MAX  = 0.25  # midpoint
+
+# If pin gives EdgeMean~22, empty gives EdgeMean~6:
+EDGE_MEAN_MIN   = 14    # midpoint
