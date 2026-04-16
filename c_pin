@@ -914,3 +914,111 @@ if __name__ == "__main__":
 
     else:
         print("Invalid choice")
+
+
+
+// in case i want to go with the color logic then 
+add a new function 
+def detect_pcb_present(frame):
+    """
+    Detects presence of PCB based on blue/green color.
+    Returns True if PCB detected.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Blue PCB range
+    lower_blue = np.array([90, 80, 50])
+    upper_blue = np.array([130, 255, 255])
+
+    # Green PCB range (for light green boards)
+    lower_green = np.array([35, 50, 50])
+    upper_green = np.array([85, 255, 255])
+
+    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+    mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+    mask = cv2.bitwise_or(mask_blue, mask_green)
+
+    # Count how much PCB color is present
+    pcb_pixels = cv2.countNonZero(mask)
+    total_pixels = frame.shape[0] * frame.shape[1]
+
+    ratio = pcb_pixels / total_pixels
+
+    # Threshold → adjust if needed
+    return ratio > 0.10   # 10% of frame is PCB
+
+and modify run cameradef run_camera(calibration_mode=False):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Camera not accessible")
+        return
+
+    print("Camera running. ESC = quit")
+
+    pcb_detected = False
+    detection_start_time = None
+    DELAY_SECONDS = 6   # your requirement
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        display_frame = frame.copy()
+
+        # STEP 1: Detect PCB
+        if detect_pcb_present(frame):
+            if not pcb_detected:
+                pcb_detected = True
+                detection_start_time = time.time()
+                print("PCB detected → starting timer...")
+        else:
+            pcb_detected = False
+            detection_start_time = None
+
+        # STEP 2: Wait for delay
+        if pcb_detected and detection_start_time is not None:
+            elapsed = time.time() - detection_start_time
+
+            cv2.putText(display_frame,
+                        f"Waiting: {elapsed:.1f}/{DELAY_SECONDS}s",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 255), 2)
+
+            if elapsed >= DELAY_SECONDS:
+                print("Capturing & Processing...")
+
+                original_frame = frame.copy()
+
+                pin_count, output, results = check_pins_roi(frame, calibration_mode)
+
+                if pin_count == EXPECTED_HOLES:
+                    status = "OK"
+                    color = (0, 255, 0)
+                else:
+                    status = "ERROR"
+                    color = (0, 0, 255)
+                    missing = [str(r[0]) for r in results if not r[2]]
+                    log_error(f"Pins: {pin_count}/6. Missing at holes: {', '.join(missing)}")
+
+                output = draw_status(output, pin_count, status, color)
+                save_frame(original_frame, output, status, pin_count)
+
+                cv2.imshow("PCB Inspection Result", output)
+                cv2.waitKey(2000)
+
+                # Reset after processing
+                pcb_detected = False
+                detection_start_time = None
+
+                continue
+
+        cv2.imshow("Live Feed", display_frame)
+
+        key = cv2.waitKey(1)
+        if key == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows() 
