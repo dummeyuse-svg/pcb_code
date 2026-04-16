@@ -372,3 +372,545 @@ DARK_RATIO_MAX  = 0.25  # midpoint
 
 # If pin gives EdgeMean~22, empty gives EdgeMean~6:
 EDGE_MEAN_MIN   = 14    # midpoint
+
+
+part 2 
+import cv2
+import numpy as np
+import time
+import os
+import json
+from tkinter import Tk, filedialog
+
+# ---------------------------
+# CONFIGURATION
+# ---------------------------
+
+EXPECTED_HOLES      = 6
+ROI_SIZE            = 22
+CENTER_CROP         = 0.5
+
+SAVE_DIR = "captured_frames"
+SAVE_ONLY_ON_ERROR = False
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# File where per-hole calibration data is saved
+CALIBRATION_FILE = "hole_calibration.json"
+
+# ---------------------------
+# CALIBRATED POSITIONS
+# ---------------------------
+
+EXPECTED_POSITIONS = [
+    (29,  34),
+    (186, 38),
+    (333, 36),
+    (21,  93),
+    (187, 92),
+    (338, 89)
+]
+
+# ---------------------------
+# GLOBAL: Per-hole thresholds (loaded from calibration file if present)
+# Structure: { hole_index: { "mean_thresh": float, "dark_thresh": float, "edge_thresh": float } }
+# ---------------------------
+
+PER_HOLE_THRESHOLDS = {}
+
+# Fallback global thresholds (only used if calibration file is absent)
+FALLBACK_PIN_MEAN_MIN   = 130
+FALLBACK_DARK_RATIO_MAX = 0.20
+FALLBACK_EDGE_MEAN_MIN  = 15
+
+# Feature weights for weighted scoring (must sum to 1.0)
+# Mean brightness is most reliable for metal detection → highest weight
+WEIGHT_MEAN  = 0.50
+WEIGHT_DARK  = 0.30
+WEIGHT_EDGE  = 0.20
+
+
+# ---------------------------
+# FEATURE EXTRACTION
+# ---------------------------
+
+def extract_roi_features(gray, x, y):
+    """
+    Extracts tight center ROI around (x, y) and computes 6 features.
+    
+    Returns: dict of features, roi array, bounding box
+    """
+    h, w = gray.shape
+
+    x1 = max(0, x - ROI_SIZE)
+    y1 = max(0, y - ROI_SIZE)
+    x2 = min(w, x + ROI_SIZE)
+    y2 = min(h, y + ROI_SIZE)
+
+    roi_full = gray[y1:y2, x1:x2]
+    if roi_full.size == 0:
+        return None
+
+    h_roi, w_roi = roi_full.shape
+    margin_x = int(w_roi * (1 - CENTER_CROP) / 2)
+    margin_y = int(h_roi * (1 - CENTER_CROP) / 2)
+    roi = roi_full[margin_y:h_roi - margin_y, margin_x:w_roi - margin_x]
+
+    if roi.size == 0:
+        return None
+
+    # Feature 1: Mean brightness (primary — metal reflects, empty absorbs)
+    mean_val = float(np.mean(roi))
+
+    # Feature 2: Standard deviation (texture indicator)
+    std_val = float(np.std(roi))
+
+    # Feature 3: Dark pixel ratio
+    dark_pixels = np.sum(roi < 80)
+    dark_ratio = dark_pixels / roi.size
+
+    # Feature 4: Laplacian edge mean (internal structure from metal fill)
+    laplacian = cv2.Laplacian(roi, cv2.CV_64F)
+    edge_mean = float(np.mean(np.abs(laplacian)))
+
+    # Feature 5: 90th percentile brightness (catches small bright metallic spot
+    # even if most of ROI is dark — important for partial fills)
+    bright_p90 = float(np.percentile(roi, 90))
+
+    # Feature 6: Bright pixel ratio (pixels above 150 — metal highlight)
+    bright_pixels = np.sum(roi > 150)
+    bright_ratio = bright_pixels / roi.size
+
+    features = {
+        "mean":         mean_val,
+        "std":          std_val,
+        "dark_ratio":   dark_ratio,
+        "edge_mean":    edge_mean,
+        "bright_p90":   bright_p90,
+        "bright_ratio": bright_ratio,
+    }
+
+    return features, roi, (x1, y1, x2, y2)
+
+
+# ---------------------------
+# CALIBRATION ROUTINES
+# ---------------------------
+
+def collect_calibration_samples(image_paths, label):
+    """
+    Given a list of image paths and a label ("pin" or "empty"),
+    returns per-hole feature averages across all images.
+    """
+    # hole_idx -> list of feature dicts
+    hole_data = {i: [] for i in range(EXPECTED_HOLES)}
+
+    for path in image_paths:
+        frame = cv2.imread(path)
+        if frame is None:
+            print(f"  ⚠️  Could not load {path}, skipping")
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+        for idx, (x, y) in enumerate(EXPECTED_POSITIONS):
+            result = extract_roi_features(gray, x, y)
+            if result is None:
+                continue
+            features, _, _ = result
+            hole_data[idx].append(features)
+
+    # Average across images
+    averages = {}
+    for idx, samples in hole_data.items():
+        if not samples:
+            continue
+        avg = {}
+        for key in samples[0]:
+            avg[key] = float(np.mean([s[key] for s in samples]))
+        averages[idx] = avg
+        print(f"  Hole {idx+1} [{label}]: "
+              f"Mean={avg['mean']:.1f} | "
+              f"DarkRatio={avg['dark_ratio']:.3f} | "
+              f"EdgeMean={avg['edge_mean']:.1f} | "
+              f"BrightP90={avg['bright_p90']:.1f} | "
+              f"BrightRatio={avg['bright_ratio']:.3f}")
+
+    return averages
+
+
+def run_calibration():
+    """
+    Interactive calibration:
+    1. User selects N images with ALL pins clamped
+    2. User selects N images with ALL pins empty
+    3. Per-hole thresholds are computed as midpoints and saved
+    """
+    print("\n=== CALIBRATION MODE ===")
+    print("Step 1: Select images where ALL 6 pins are CLAMPED (pick multiple for robustness)")
+
+    Tk().withdraw()
+    pin_paths = filedialog.askopenfilenames(
+        title="Select ALL-PINS-CLAMPED images",
+        filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")]
+    )
+    if not pin_paths:
+        print("❌ No images selected.")
+        return
+
+    print(f"\n  → {len(pin_paths)} clamped image(s) selected")
+    print("\nCollecting features for CLAMPED state...")
+    pin_avgs = collect_calibration_samples(pin_paths, "pin")
+
+    print("\nStep 2: Select images where ALL 6 pins are EMPTY (unclamped)")
+    empty_paths = filedialog.askopenfilenames(
+        title="Select ALL-PINS-EMPTY images",
+        filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")]
+    )
+    if not empty_paths:
+        print("❌ No images selected.")
+        return
+
+    print(f"\n  → {len(empty_paths)} empty image(s) selected")
+    print("\nCollecting features for EMPTY state...")
+    empty_avgs = collect_calibration_samples(empty_paths, "empty")
+
+    # Compute per-hole thresholds as midpoints
+    thresholds = {}
+    print("\n=== COMPUTED THRESHOLDS (midpoints) ===")
+    for idx in range(EXPECTED_HOLES):
+        if idx not in pin_avgs or idx not in empty_avgs:
+            print(f"  Hole {idx+1}: ⚠️  Missing data, skipping")
+            continue
+
+        p = pin_avgs[idx]
+        e = empty_avgs[idx]
+
+        thresh = {
+            "mean_thresh":        (p["mean"]         + e["mean"])         / 2,
+            "dark_thresh":        (p["dark_ratio"]    + e["dark_ratio"])   / 2,
+            "edge_thresh":        (p["edge_mean"]     + e["edge_mean"])    / 2,
+            "bright_p90_thresh":  (p["bright_p90"]    + e["bright_p90"])   / 2,
+            "bright_ratio_thresh":(p["bright_ratio"]  + e["bright_ratio"]) / 2,
+            # Store margins for confidence checks
+            "mean_margin":        abs(p["mean"]        - e["mean"]),
+            "dark_margin":        abs(p["dark_ratio"]  - e["dark_ratio"]),
+            "edge_margin":        abs(p["edge_mean"]   - e["edge_mean"]),
+        }
+        thresholds[str(idx)] = thresh
+
+        print(f"\n  Hole {idx+1}:")
+        print(f"    mean_thresh       = {thresh['mean_thresh']:.1f}  "
+              f"(pin={p['mean']:.1f}, empty={e['mean']:.1f}, margin={thresh['mean_margin']:.1f})")
+        print(f"    dark_thresh       = {thresh['dark_thresh']:.3f}  "
+              f"(pin={p['dark_ratio']:.3f}, empty={e['dark_ratio']:.3f}, margin={thresh['dark_margin']:.3f})")
+        print(f"    edge_thresh       = {thresh['edge_thresh']:.1f}  "
+              f"(pin={p['edge_mean']:.1f}, empty={e['edge_mean']:.1f}, margin={thresh['edge_margin']:.1f})")
+        print(f"    bright_p90_thresh = {thresh['bright_p90_thresh']:.1f}")
+        print(f"    bright_ratio_thresh = {thresh['bright_ratio_thresh']:.3f}")
+
+    # Save to JSON
+    with open(CALIBRATION_FILE, "w") as f:
+        json.dump(thresholds, f, indent=2)
+
+    print(f"\n✅ Calibration saved to {CALIBRATION_FILE}")
+    print("⚠️  Low margin warnings:")
+    for idx_str, thresh in thresholds.items():
+        if thresh["mean_margin"] < 30:
+            print(f"  Hole {int(idx_str)+1}: Low mean margin ({thresh['mean_margin']:.1f}) — "
+                  f"consider improving lighting or ROI position")
+
+    load_calibration()
+
+
+def load_calibration():
+    """Load per-hole thresholds from JSON into PER_HOLE_THRESHOLDS."""
+    global PER_HOLE_THRESHOLDS
+    if not os.path.exists(CALIBRATION_FILE):
+        print(f"⚠️  No calibration file found ({CALIBRATION_FILE}). Using fallback thresholds.")
+        return False
+
+    with open(CALIBRATION_FILE, "r") as f:
+        raw = json.load(f)
+
+    PER_HOLE_THRESHOLDS = {int(k): v for k, v in raw.items()}
+    print(f"✅ Calibration loaded from {CALIBRATION_FILE} for {len(PER_HOLE_THRESHOLDS)} holes")
+    return True
+
+
+# ---------------------------
+# PIN DECISION LOGIC
+# ---------------------------
+
+def is_pin_present(features, hole_idx):
+    """
+    Weighted confidence score using per-hole calibrated thresholds.
+    
+    Returns: (pin_detected: bool, confidence: float 0-1, detail: str)
+    """
+    if hole_idx in PER_HOLE_THRESHOLDS:
+        thresh = PER_HOLE_THRESHOLDS[hole_idx]
+        mean_thresh        = thresh["mean_thresh"]
+        dark_thresh        = thresh["dark_thresh"]
+        edge_thresh        = thresh["edge_thresh"]
+        bright_p90_thresh  = thresh.get("bright_p90_thresh", mean_thresh)
+        bright_ratio_thresh= thresh.get("bright_ratio_thresh", 0.10)
+    else:
+        # Fallback to global
+        mean_thresh         = FALLBACK_PIN_MEAN_MIN
+        dark_thresh         = FALLBACK_DARK_RATIO_MAX
+        edge_thresh         = FALLBACK_EDGE_MEAN_MIN
+        bright_p90_thresh   = FALLBACK_PIN_MEAN_MIN
+        bright_ratio_thresh = 0.10
+
+    mean_val    = features["mean"]
+    dark_ratio  = features["dark_ratio"]
+    edge_mean   = features["edge_mean"]
+    bright_p90  = features["bright_p90"]
+    bright_ratio= features["bright_ratio"]
+
+    # ---- HARD OVERRIDE: very bright 90th percentile almost always = metal ----
+    # Catches partial fills where mean is dragged down by surrounding dark area
+    if bright_p90 > bright_p90_thresh * 1.3:
+        return True, 0.95, "bright_p90_override"
+
+    # ---- HARD OVERRIDE: very high bright pixel ratio ----
+    if bright_ratio > bright_ratio_thresh * 2.0:
+        return True, 0.93, "bright_ratio_override"
+
+    # ---- HARD OVERRIDE: clearly empty ----
+    if mean_val < mean_thresh * 0.55 and dark_ratio > dark_thresh * 1.8:
+        return False, 0.95, "clearly_empty"
+
+    # ---- WEIGHTED SCORE ----
+    # Each feature contributes a score in [0, 1]:
+    # score=1 → strongly indicates PIN, score=0 → strongly indicates EMPTY
+
+    # Mean: sigmoid-like — how far above threshold?
+    mean_score = np.clip((mean_val - mean_thresh) / (mean_thresh * 0.4) * 0.5 + 0.5, 0, 1)
+
+    # Dark ratio: inverted — low dark ratio = pin
+    dark_score = np.clip((dark_thresh - dark_ratio) / (dark_thresh * 0.8) * 0.5 + 0.5, 0, 1)
+
+    # Edge: how far above threshold?
+    edge_score = np.clip((edge_mean - edge_thresh) / (edge_thresh * 0.8) * 0.5 + 0.5, 0, 1)
+
+    # Weighted combination
+    confidence = (WEIGHT_MEAN * mean_score +
+                  WEIGHT_DARK * dark_score +
+                  WEIGHT_EDGE * edge_score)
+
+    detail = f"W({mean_score:.2f},{dark_score:.2f},{edge_score:.2f})"
+
+    # Decision threshold: 0.5 (balanced midpoint)
+    return confidence >= 0.5, float(confidence), detail
+
+
+# ---------------------------
+# MAIN INSPECTION FUNCTION
+# ---------------------------
+
+def check_pins_roi(frame, calibration_mode=False):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    pin_count = 0
+    results = []
+
+    for idx, (x, y) in enumerate(EXPECTED_POSITIONS):
+        result = extract_roi_features(gray, x, y)
+
+        if result is None:
+            print(f"Hole {idx+1}: ⚠️  ROI out of bounds, skipping")
+            continue
+
+        features, roi, (x1, y1, x2, y2) = result
+
+        pin_detected, confidence, detail = is_pin_present(features, idx)
+
+        if calibration_mode:
+            print(
+                f"Hole {idx+1}: "
+                f"Mean={features['mean']:6.1f} | "
+                f"DarkRatio={features['dark_ratio']:.3f} | "
+                f"EdgeMean={features['edge_mean']:5.1f} | "
+                f"BrightP90={features['bright_p90']:5.1f} | "
+                f"BrightRatio={features['bright_ratio']:.3f} | "
+                f"Conf={confidence:.2f} [{detail}] → "
+                f"{'PIN ✅' if pin_detected else 'EMPTY ❌'}"
+            )
+
+        if pin_detected:
+            label = "PIN"
+            color = (0, 255, 0)
+            pin_count += 1
+        else:
+            label = "EMPTY"
+            color = (0, 0, 255)
+
+        results.append((idx + 1, label, pin_detected, confidence))
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.drawMarker(frame, (x, y), color,
+                       markerType=cv2.MARKER_CROSS,
+                       markerSize=8, thickness=1)
+        cv2.putText(frame, f"H{idx+1}:{label} {confidence:.2f}",
+                    (x1, y2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1)
+        cv2.putText(frame,
+                    f"M:{features['mean']:.0f} D:{features['dark_ratio']:.2f} E:{features['edge_mean']:.1f}",
+                    (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.32, color, 1)
+
+    return pin_count, frame, results
+
+
+# ---------------------------
+# LOG / SAVE / STATUS
+# ---------------------------
+
+def log_error(message):
+    with open("error_log.txt", "a") as f:
+        f.write(f"{time.ctime()} - {message}\n")
+    print("ERROR:", message)
+
+
+def save_frame(original, processed, status, pin_count):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    raw_path = os.path.join(SAVE_DIR, f"{timestamp}_raw.jpg")
+    proc_path = os.path.join(SAVE_DIR, f"{timestamp}_{status}_{pin_count}of6.jpg")
+    cv2.imwrite(raw_path, original)
+    cv2.imwrite(proc_path, processed)
+    print(f"[SAVED] {proc_path}")
+
+
+def draw_status(frame, pin_count, status, color):
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 55), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+    cv2.putText(frame,
+                f"Status: {status}   Pins: {pin_count}/{EXPECTED_HOLES}",
+                (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    return frame
+
+
+# ---------------------------
+# TEST ON IMAGE
+# ---------------------------
+
+def test_on_image(image_path, calibration_mode=False):
+    frame = cv2.imread(image_path)
+    if frame is None:
+        print("❌ Could not load image:", image_path)
+        return
+
+    original_frame = frame.copy()
+    pin_count, output, results = check_pins_roi(frame, calibration_mode=calibration_mode)
+
+    if pin_count == EXPECTED_HOLES:
+        status = "OK"
+        color  = (0, 255, 0)
+    else:
+        status  = "ERROR"
+        color   = (0, 0, 255)
+        missing = [str(r[0]) for r in results if not r[2]]
+        log_error(f"[IMAGE] Pins: {pin_count}/6. Missing at holes: {', '.join(missing)}")
+
+    output = draw_status(output, pin_count, status, color)
+    save_frame(original_frame, output, status, pin_count)
+    cv2.imshow("PCB Pin Inspection", output)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+def pick_image(multi=False):
+    Tk().withdraw()
+    if multi:
+        return filedialog.askopenfilenames(
+            title="Select PCB Images",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")]
+        )
+    return filedialog.askopenfilename(
+        title="Select PCB Image",
+        filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")]
+    )
+
+
+# ---------------------------
+# CAMERA MODE
+# ---------------------------
+
+def run_camera(calibration_mode=False):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Camera not accessible")
+        return
+
+    print("Camera running. ESC = quit | c = toggle calibration mode")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        original_frame = frame.copy()
+        pin_count, output, results = check_pins_roi(frame, calibration_mode=calibration_mode)
+
+        if pin_count == EXPECTED_HOLES:
+            status = "OK"
+            color  = (0, 255, 0)
+        else:
+            status  = "ERROR"
+            color   = (0, 0, 255)
+            missing = [str(r[0]) for r in results if not r[2]]
+            log_error(f"Pins: {pin_count}/6. Missing at holes: {', '.join(missing)}")
+
+        output = draw_status(output, pin_count, status, color)
+
+        if not SAVE_ONLY_ON_ERROR or status == "ERROR":
+            save_frame(original_frame, output, status, pin_count)
+
+        cv2.imshow("PCB Pin Inspection", output)
+
+        key = cv2.waitKey(1)
+        if key == 27:
+            break
+        elif key == ord('c'):
+            calibration_mode = not calibration_mode
+            print(f"Calibration mode: {'ON' if calibration_mode else 'OFF'}")
+
+        time.sleep(0.5)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# ---------------------------
+# MAIN
+# ---------------------------
+
+if __name__ == "__main__":
+    # Always try to load calibration at startup
+    load_calibration()
+
+    print("\n=== PCB Pin Inspection System v2 ===")
+    print("1 → Calibrate (REQUIRED first time — select clamped + empty images)")
+    print("2 → Test on Image (Normal)")
+    print("3 → Test on Image (Calibration/Debug Mode)")
+    print("4 → Run Camera (Normal)")
+    print("5 → Run Camera (Debug Mode)")
+
+    choice = input("\nEnter choice (1-5): ").strip()
+
+    if choice == "1":
+        run_calibration()
+
+    elif choice in ("2", "3"):
+        path = pick_image()
+        if path:
+            test_on_image(path, calibration_mode=(choice == "3"))
+        else:
+            print("No image selected.")
+
+    elif choice in ("4", "5"):
+        run_camera(calibration_mode=(choice == "5"))
+
+    else:
+        print("Invalid choice")
