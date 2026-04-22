@@ -1,0 +1,756 @@
+import cv2
+import numpy as np
+import time
+import os
+import json
+from tkinter import Tk, filedialog
+
+# ── Raspberry Pi GPIO ──────────────────────────────────────────────────────────
+try:
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
+except ImportError:
+    GPIO_AVAILABLE = False
+    print("⚠️  RPi.GPIO not found — running in SIMULATION mode (keyboard triggers)")
+
+# ── Picamera2 ─────────────────────────────────────────────────────────────────
+try:
+    from picamera2 import Picamera2
+    PICAMERA_AVAILABLE = True
+except ImportError:
+    PICAMERA_AVAILABLE = False
+    print("⚠️  Picamera2 not found — camera modes will use OpenCV VideoCapture")
+
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+EXPECTED_HOLES      = 6
+ROI_SIZE            = 22
+CENTER_CROP         = 0.5
+
+SAVE_DIR            = "captured_frames"
+SAVE_ONLY_ON_ERROR  = False
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+CALIBRATION_FILE    = "hole_calibration.json"
+
+# ── GPIO Pin Assignment (BCM numbering) ───────────────────────────────────────
+PLC_CLAMP_INPUT_PIN = 17   # INPUT  — optocoupler output connected here
+                            #          HIGH = jig is clamped, LOW = released
+
+PLC_FAIL_OUTPUT_PIN = 27   # OUTPUT — relay IN connected here
+                            #          Drives relay for machine STOP / alarm
+                            #          Wired NC (fail-safe: LOW = relay closed = stop)
+
+PLC_PASS_OUTPUT_PIN = 22   # OUTPUT — optional second relay for green light / conveyor go
+
+# Timing
+CLAMP_DEBOUNCE_S    = 0.05  # 50ms debounce on clamp input
+JIG_SETTLE_S        = 0.30  # Wait after clamp before capturing (vibration settle)
+RESULT_DISPLAY_S    = 2.0   # How long to show result on screen
+SIGNAL_PULSE_S      = 0.5   # How long the output relay pulse lasts
+
+# ==============================================================================
+# CALIBRATED POSITIONS
+# ==============================================================================
+
+EXPECTED_POSITIONS = [
+    (29,  34),
+    (186, 38),
+    (333, 36),
+    (21,  93),
+    (187, 92),
+    (338, 89)
+]
+
+# ==============================================================================
+# PER-HOLE THRESHOLDS  (loaded from calibration file)
+# ==============================================================================
+
+PER_HOLE_THRESHOLDS = {}
+
+FALLBACK_PIN_MEAN_MIN   = 130
+FALLBACK_DARK_RATIO_MAX = 0.20
+FALLBACK_EDGE_MEAN_MIN  = 15
+
+WEIGHT_MEAN  = 0.50
+WEIGHT_DARK  = 0.30
+WEIGHT_EDGE  = 0.20
+
+
+# ==============================================================================
+# GPIO FUNCTIONS
+# ==============================================================================
+
+def setup_gpio():
+    if not GPIO_AVAILABLE:
+        print("[SIM] GPIO setup skipped — simulation mode active")
+        return
+
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+
+    # Clamp signal INPUT — pull-down so pin reads LOW when nothing connected
+    GPIO.setup(PLC_CLAMP_INPUT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+    # Output pins — start LOW
+    # LOW = relay de-energized = NC closed = machine stopped (fail-safe default)
+    # We'll drive HIGH during normal standby to keep machine running
+    GPIO.setup(PLC_FAIL_OUTPUT_PIN, GPIO.OUT, initial=GPIO.HIGH)  # HIGH = relay on = NC open = machine OK
+    GPIO.setup(PLC_PASS_OUTPUT_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+    print("✅ GPIO initialized (BCM mode)")
+    print(f"   Clamp input  → GPIO {PLC_CLAMP_INPUT_PIN}")
+    print(f"   FAIL output  → GPIO {PLC_FAIL_OUTPUT_PIN}")
+    print(f"   PASS output  → GPIO {PLC_PASS_OUTPUT_PIN}")
+
+
+def cleanup_gpio():
+    if not GPIO_AVAILABLE:
+        return
+    # On exit: pull FAIL pin LOW → relay releases → NC closes → machine stops
+    # This is the fail-safe: if software exits unexpectedly, machine stops
+    GPIO.output(PLC_FAIL_OUTPUT_PIN, GPIO.LOW)
+    GPIO.output(PLC_PASS_OUTPUT_PIN, GPIO.LOW)
+    GPIO.cleanup()
+    print("GPIO cleaned up")
+
+
+def read_clamp_pin():
+    """Returns True if clamp signal is active (HIGH)."""
+    if not GPIO_AVAILABLE:
+        return False   # simulation: always return False, keyboard used instead
+    return GPIO.input(PLC_CLAMP_INPUT_PIN) == GPIO.HIGH
+
+
+def send_pass_signal():
+    """
+    PASS: keep FAIL relay energized (machine continues), pulse PASS relay.
+    """
+    print("   → Sending PASS signal to PLC")
+    if GPIO_AVAILABLE:
+        GPIO.output(PLC_FAIL_OUTPUT_PIN, GPIO.HIGH)   # keep machine running
+        GPIO.output(PLC_PASS_OUTPUT_PIN, GPIO.HIGH)   # pulse green light
+        time.sleep(SIGNAL_PULSE_S)
+        GPIO.output(PLC_PASS_OUTPUT_PIN, GPIO.LOW)
+    else:
+        print("[SIM] PASS pulse sent")
+
+
+def send_fail_signal():
+    """
+    FAIL: de-energize FAIL relay → NC closes → machine stops.
+    Held LOW until operator resets (or next cycle starts).
+    """
+    print("   → Sending FAIL signal to PLC — machine STOP")
+    if GPIO_AVAILABLE:
+        GPIO.output(PLC_FAIL_OUTPUT_PIN, GPIO.LOW)    # relay drops → machine stops
+        GPIO.output(PLC_PASS_OUTPUT_PIN, GPIO.LOW)
+    else:
+        print("[SIM] FAIL signal sent — machine would stop")
+
+
+def reset_outputs():
+    """Call this at the start of each new cycle."""
+    if GPIO_AVAILABLE:
+        GPIO.output(PLC_FAIL_OUTPUT_PIN, GPIO.HIGH)   # re-energize = machine OK to run
+        GPIO.output(PLC_PASS_OUTPUT_PIN, GPIO.LOW)
+    else:
+        print("[SIM] Outputs reset for new cycle")
+
+
+# ==============================================================================
+# FEATURE EXTRACTION
+# ==============================================================================
+
+def extract_roi_features(gray, x, y):
+    h, w = gray.shape
+
+    x1 = max(0, x - ROI_SIZE)
+    y1 = max(0, y - ROI_SIZE)
+    x2 = min(w, x + ROI_SIZE)
+    y2 = min(h, y + ROI_SIZE)
+
+    roi_full = gray[y1:y2, x1:x2]
+    if roi_full.size == 0:
+        return None
+
+    h_roi, w_roi = roi_full.shape
+    margin_x = int(w_roi * (1 - CENTER_CROP) / 2)
+    margin_y = int(h_roi * (1 - CENTER_CROP) / 2)
+    roi = roi_full[margin_y:h_roi - margin_y, margin_x:w_roi - margin_x]
+
+    if roi.size == 0:
+        return None
+
+    mean_val     = float(np.mean(roi))
+    std_val      = float(np.std(roi))
+    dark_pixels  = np.sum(roi < 80)
+    dark_ratio   = dark_pixels / roi.size
+    laplacian    = cv2.Laplacian(roi, cv2.CV_64F)
+    edge_mean    = float(np.mean(np.abs(laplacian)))
+    bright_p90   = float(np.percentile(roi, 90))
+    bright_ratio = float(np.sum(roi > 150) / roi.size)
+
+    features = {
+        "mean":         mean_val,
+        "std":          std_val,
+        "dark_ratio":   dark_ratio,
+        "edge_mean":    edge_mean,
+        "bright_p90":   bright_p90,
+        "bright_ratio": bright_ratio,
+    }
+    return features, roi, (x1, y1, x2, y2)
+
+
+# ==============================================================================
+# CALIBRATION
+# ==============================================================================
+
+def collect_calibration_samples(image_paths, label):
+    hole_data = {i: [] for i in range(EXPECTED_HOLES)}
+
+    for path in image_paths:
+        frame = cv2.imread(path)
+        if frame is None:
+            print(f"  ⚠️  Could not load {path}, skipping")
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+        for idx, (x, y) in enumerate(EXPECTED_POSITIONS):
+            result = extract_roi_features(gray, x, y)
+            if result is None:
+                continue
+            features, _, _ = result
+            hole_data[idx].append(features)
+
+    averages = {}
+    for idx, samples in hole_data.items():
+        if not samples:
+            continue
+        avg = {key: float(np.mean([s[key] for s in samples])) for key in samples[0]}
+        averages[idx] = avg
+        print(f"  Hole {idx+1} [{label}]: "
+              f"Mean={avg['mean']:.1f} | "
+              f"DarkRatio={avg['dark_ratio']:.3f} | "
+              f"EdgeMean={avg['edge_mean']:.1f} | "
+              f"BrightP90={avg['bright_p90']:.1f} | "
+              f"BrightRatio={avg['bright_ratio']:.3f}")
+    return averages
+
+
+def run_calibration():
+    print("\n=== CALIBRATION MODE ===")
+    print("Step 1: Select images where ALL 6 pins are CLAMPED")
+
+    Tk().withdraw()
+    pin_paths = filedialog.askopenfilenames(
+        title="Select ALL-PINS-CLAMPED images",
+        filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")]
+    )
+    if not pin_paths:
+        print("❌ No images selected.")
+        return
+
+    print(f"\n  → {len(pin_paths)} clamped image(s) selected")
+    pin_avgs = collect_calibration_samples(pin_paths, "pin")
+
+    print("\nStep 2: Select images where ALL 6 pins are EMPTY")
+    empty_paths = filedialog.askopenfilenames(
+        title="Select ALL-PINS-EMPTY images",
+        filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")]
+    )
+    if not empty_paths:
+        print("❌ No images selected.")
+        return
+
+    print(f"\n  → {len(empty_paths)} empty image(s) selected")
+    empty_avgs = collect_calibration_samples(empty_paths, "empty")
+
+    thresholds = {}
+    print("\n=== COMPUTED THRESHOLDS ===")
+    for idx in range(EXPECTED_HOLES):
+        if idx not in pin_avgs or idx not in empty_avgs:
+            print(f"  Hole {idx+1}: ⚠️  Missing data, skipping")
+            continue
+
+        p = pin_avgs[idx]
+        e = empty_avgs[idx]
+
+        thresh = {
+            "mean_thresh":          (p["mean"]         + e["mean"])         / 2,
+            "dark_thresh":          (p["dark_ratio"]    + e["dark_ratio"])   / 2,
+            "edge_thresh":          (p["edge_mean"]     + e["edge_mean"])    / 2,
+            "bright_p90_thresh":    (p["bright_p90"]    + e["bright_p90"])   / 2,
+            "bright_ratio_thresh":  (p["bright_ratio"]  + e["bright_ratio"]) / 2,
+            "mean_margin":          abs(p["mean"]       - e["mean"]),
+            "dark_margin":          abs(p["dark_ratio"] - e["dark_ratio"]),
+            "edge_margin":          abs(p["edge_mean"]  - e["edge_mean"]),
+        }
+        thresholds[str(idx)] = thresh
+
+        print(f"\n  Hole {idx+1}:")
+        print(f"    mean_thresh = {thresh['mean_thresh']:.1f}  "
+              f"(pin={p['mean']:.1f}, empty={e['mean']:.1f}, "
+              f"margin={thresh['mean_margin']:.1f})")
+        print(f"    dark_thresh = {thresh['dark_thresh']:.3f}  "
+              f"(pin={p['dark_ratio']:.3f}, empty={e['dark_ratio']:.3f})")
+        print(f"    edge_thresh = {thresh['edge_thresh']:.1f}  "
+              f"(pin={p['edge_mean']:.1f}, empty={e['edge_mean']:.1f})")
+
+        if thresh["mean_margin"] < 30:
+            print(f"    ⚠️  LOW MARGIN — improve lighting or check ROI position")
+
+    with open(CALIBRATION_FILE, "w") as f:
+        json.dump(thresholds, f, indent=2)
+
+    print(f"\n✅ Calibration saved to {CALIBRATION_FILE}")
+    load_calibration()
+
+
+def load_calibration():
+    global PER_HOLE_THRESHOLDS
+    if not os.path.exists(CALIBRATION_FILE):
+        print(f"⚠️  No calibration file found. Using fallback thresholds.")
+        return False
+
+    with open(CALIBRATION_FILE, "r") as f:
+        raw = json.load(f)
+
+    PER_HOLE_THRESHOLDS = {int(k): v for k, v in raw.items()}
+    print(f"✅ Calibration loaded for {len(PER_HOLE_THRESHOLDS)} holes")
+    return True
+
+
+# ==============================================================================
+# PIN DETECTION
+# ==============================================================================
+
+def is_pin_present(features, hole_idx):
+    if hole_idx in PER_HOLE_THRESHOLDS:
+        thresh = PER_HOLE_THRESHOLDS[hole_idx]
+        mean_thresh         = thresh["mean_thresh"]
+        dark_thresh         = thresh["dark_thresh"]
+        edge_thresh         = thresh["edge_thresh"]
+        bright_p90_thresh   = thresh.get("bright_p90_thresh", mean_thresh)
+        bright_ratio_thresh = thresh.get("bright_ratio_thresh", 0.10)
+    else:
+        mean_thresh         = FALLBACK_PIN_MEAN_MIN
+        dark_thresh         = FALLBACK_DARK_RATIO_MAX
+        edge_thresh         = FALLBACK_EDGE_MEAN_MIN
+        bright_p90_thresh   = FALLBACK_PIN_MEAN_MIN
+        bright_ratio_thresh = 0.10
+
+    mean_val     = features["mean"]
+    dark_ratio   = features["dark_ratio"]
+    edge_mean    = features["edge_mean"]
+    bright_p90   = features["bright_p90"]
+    bright_ratio = features["bright_ratio"]
+
+    # Hard overrides
+    if bright_p90 > bright_p90_thresh * 1.3:
+        return True, 0.95, "bright_p90_override"
+    if bright_ratio > bright_ratio_thresh * 2.0:
+        return True, 0.93, "bright_ratio_override"
+    if mean_val < mean_thresh * 0.55 and dark_ratio > dark_thresh * 1.8:
+        return False, 0.95, "clearly_empty"
+
+    # Weighted score
+    mean_score = float(np.clip(
+        (mean_val  - mean_thresh) / (mean_thresh * 0.4) * 0.5 + 0.5, 0, 1))
+    dark_score = float(np.clip(
+        (dark_thresh - dark_ratio) / (dark_thresh * 0.8) * 0.5 + 0.5, 0, 1))
+    edge_score = float(np.clip(
+        (edge_mean  - edge_thresh) / (edge_thresh * 0.8) * 0.5 + 0.5, 0, 1))
+
+    confidence = (WEIGHT_MEAN * mean_score +
+                  WEIGHT_DARK * dark_score +
+                  WEIGHT_EDGE * edge_score)
+
+    detail = f"W({mean_score:.2f},{dark_score:.2f},{edge_score:.2f})"
+    return confidence >= 0.5, float(confidence), detail
+
+
+# ==============================================================================
+# INSPECTION
+# ==============================================================================
+
+def check_pins_roi(frame, calibration_mode=False):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    pin_count = 0
+    results   = []
+
+    for idx, (x, y) in enumerate(EXPECTED_POSITIONS):
+        result = extract_roi_features(gray, x, y)
+        if result is None:
+            print(f"Hole {idx+1}: ⚠️  ROI out of bounds")
+            continue
+
+        features, roi, (x1, y1, x2, y2) = result
+        pin_detected, confidence, detail = is_pin_present(features, idx)
+
+        if calibration_mode:
+            print(
+                f"Hole {idx+1}: "
+                f"Mean={features['mean']:6.1f} | "
+                f"Dark={features['dark_ratio']:.3f} | "
+                f"Edge={features['edge_mean']:5.1f} | "
+                f"P90={features['bright_p90']:5.1f} | "
+                f"Conf={confidence:.2f} [{detail}] → "
+                f"{'PIN ✅' if pin_detected else 'EMPTY ❌'}"
+            )
+
+        label = "PIN" if pin_detected else "EMPTY"
+        color = (0, 255, 0) if pin_detected else (0, 0, 255)
+        if pin_detected:
+            pin_count += 1
+
+        results.append((idx + 1, label, pin_detected, confidence))
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.drawMarker(frame, (x, y), color,
+                       markerType=cv2.MARKER_CROSS, markerSize=8, thickness=1)
+        cv2.putText(frame, f"H{idx+1}:{label} {confidence:.2f}",
+                    (x1, y2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1)
+        cv2.putText(frame,
+                    f"M:{features['mean']:.0f} D:{features['dark_ratio']:.2f}",
+                    (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.32, color, 1)
+
+    return pin_count, frame, results
+
+
+# ==============================================================================
+# UTILITIES
+# ==============================================================================
+
+def log_error(message):
+    with open("error_log.txt", "a") as f:
+        f.write(f"{time.ctime()} - {message}\n")
+    print("ERROR:", message)
+
+
+def save_frame(original, processed, status, pin_count):
+    timestamp    = time.strftime("%Y%m%d_%H%M%S")
+    raw_path     = os.path.join(SAVE_DIR, f"{timestamp}_raw.jpg")
+    proc_path    = os.path.join(SAVE_DIR, f"{timestamp}_{status}_{pin_count}of6.jpg")
+    cv2.imwrite(raw_path, original)
+    cv2.imwrite(proc_path, processed)
+    print(f"   [SAVED] {proc_path}")
+
+
+def draw_status(frame, pin_count, status, color):
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 55), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+    cv2.putText(frame,
+                f"Status: {status}   Pins: {pin_count}/{EXPECTED_HOLES}",
+                (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    return frame
+
+
+def get_camera():
+    """Returns an open camera object — Picamera2 if available, else OpenCV."""
+    if PICAMERA_AVAILABLE:
+        picam2 = Picamera2()
+        config = picam2.create_preview_configuration(
+            main={"format": "BGR888", "size": (640, 480)}
+        )
+        picam2.configure(config)
+        picam2.start()
+        time.sleep(2)
+        return picam2, "picamera2"
+    else:
+        cap = cv2.VideoCapture(0)
+        return cap, "opencv"
+
+
+def capture_frame(camera, cam_type):
+    if cam_type == "picamera2":
+        return camera.capture_array()
+    else:
+        ret, frame = camera.read()
+        return frame if ret else None
+
+
+def release_camera(camera, cam_type):
+    if cam_type == "picamera2":
+        camera.stop()
+    else:
+        camera.release()
+
+
+# ==============================================================================
+# CAMERA MODES
+# ==============================================================================
+
+def run_camera_manual(calibration_mode=False):
+    """Continuous camera — no PLC, for testing/debugging only."""
+    camera, cam_type = get_camera()
+    print("Manual mode running. ESC = quit | c = toggle debug")
+
+    while True:
+        frame = capture_frame(camera, cam_type)
+        if frame is None:
+            break
+
+        original_frame = frame.copy()
+        pin_count, output, results = check_pins_roi(frame, calibration_mode)
+
+        if pin_count == EXPECTED_HOLES:
+            status, color = "OK", (0, 255, 0)
+        else:
+            status, color = "ERROR", (0, 0, 255)
+            missing = [str(r[0]) for r in results if not r[2]]
+            log_error(f"Pins: {pin_count}/6. Missing: {', '.join(missing)}")
+
+        output = draw_status(output, pin_count, status, color)
+        save_frame(original_frame, output, status, pin_count)
+        cv2.imshow("PCB Inspection — Manual", output)
+
+        key = cv2.waitKey(1)
+        if key == 27:
+            break
+        elif key == ord('c'):
+            calibration_mode = not calibration_mode
+
+        time.sleep(0.5)
+
+    release_camera(camera, cam_type)
+    cv2.destroyAllWindows()
+
+
+def run_camera_plc(calibration_mode=False):
+    """
+    ── PRODUCTION MODE ──────────────────────────────────────────────────────
+    State machine:
+
+      STANDBY  →  (clamp signal HIGH)  →  SETTLING
+      SETTLING →  (300ms elapsed)      →  CAPTURING
+      CAPTURING → (inspection done)    →  SHOWING_RESULT
+      SHOWING_RESULT → (2s elapsed)    →  WAIT_RELEASE
+      WAIT_RELEASE → (clamp goes LOW)  →  STANDBY
+
+    FAIL output held LOW (relay drops, machine stops) until clamp releases.
+    ─────────────────────────────────────────────────────────────────────────
+    """
+    setup_gpio()
+    camera, cam_type = get_camera()
+
+    STATE_STANDBY        = "STANDBY"
+    STATE_SETTLING       = "SETTLING"
+    STATE_CAPTURING      = "CAPTURING"
+    STATE_SHOWING_RESULT = "SHOWING_RESULT"
+    STATE_WAIT_RELEASE   = "WAIT_RELEASE"
+
+    state            = STATE_STANDBY
+    state_start_time = time.time()
+    last_result      = None   # stores (pin_count, output_frame, results, status, color)
+
+    print("\n🔵 PLC MODE ACTIVE — System ready, waiting for clamp signal...\n")
+    print("   ESC = quit | c = toggle debug mode\n")
+
+    try:
+        while True:
+            # Always grab a live frame for the display
+            live_frame = capture_frame(camera, cam_type)
+            if live_frame is None:
+                break
+
+            display = live_frame.copy()
+            clamp_active = read_clamp_pin()
+
+            # ── Keyboard simulation (when GPIO not available) ──────────
+            key = cv2.waitKey(1)
+            if key == 27:
+                break
+            elif key == ord('c'):
+                calibration_mode = not calibration_mode
+                print(f"Debug mode: {'ON' if calibration_mode else 'OFF'}")
+            elif key == ord(' ') and not GPIO_AVAILABLE:
+                # Spacebar simulates clamp signal in sim mode
+                clamp_active = True
+
+            # ══════════════════════════════════════════════════════════════
+            # STATE MACHINE
+            # ══════════════════════════════════════════════════════════════
+
+            if state == STATE_STANDBY:
+                # ── Waiting for clamp ────────────────────────────────────
+                reset_outputs()
+                cv2.putText(display,
+                            "STANDBY — Waiting for clamp signal",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65, (0, 255, 255), 2)
+                if not GPIO_AVAILABLE:
+                    cv2.putText(display, "[SIM] Press SPACE to trigger",
+                                (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5, (180, 180, 0), 1)
+
+                if clamp_active:
+                    print("🔩 Clamp signal received — settling...")
+                    state            = STATE_SETTLING
+                    state_start_time = time.time()
+
+            elif state == STATE_SETTLING:
+                # ── Jig is clamping, wait for vibration to die down ──────
+                elapsed = time.time() - state_start_time
+                cv2.putText(display,
+                            f"JIG SETTLING... {elapsed:.2f}s / {JIG_SETTLE_S}s",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65, (0, 200, 255), 2)
+
+                if elapsed >= JIG_SETTLE_S:
+                    state = STATE_CAPTURING
+
+            elif state == STATE_CAPTURING:
+                # ── Capture + inspect ────────────────────────────────────
+                print("📸 Capturing image...")
+                frame          = capture_frame(camera, cam_type)
+                original_frame = frame.copy()
+
+                pin_count, output_frame, results = check_pins_roi(
+                    frame, calibration_mode
+                )
+
+                if pin_count == EXPECTED_HOLES:
+                    status = "PASS"
+                    color  = (0, 255, 0)
+                    print(f"✅ PASS — {pin_count}/{EXPECTED_HOLES} pins detected")
+                    send_pass_signal()
+                else:
+                    status  = "FAIL"
+                    color   = (0, 0, 255)
+                    missing = [str(r[0]) for r in results if not r[2]]
+                    msg     = (f"Pins: {pin_count}/{EXPECTED_HOLES}. "
+                               f"Missing at holes: {', '.join(missing)}")
+                    print(f"❌ FAIL — {msg}")
+                    log_error(msg)
+                    send_fail_signal()   # relay drops — machine stops
+
+                output_frame = draw_status(output_frame, pin_count, status, color)
+                save_frame(original_frame, output_frame, status, pin_count)
+
+                last_result      = (pin_count, output_frame, results, status, color)
+                state            = STATE_SHOWING_RESULT
+                state_start_time = time.time()
+
+            elif state == STATE_SHOWING_RESULT:
+                # ── Display result for N seconds ─────────────────────────
+                if last_result:
+                    _, result_frame, _, status, color = last_result
+                    elapsed = time.time() - state_start_time
+                    remaining = max(0, RESULT_DISPLAY_S - elapsed)
+
+                    display = result_frame.copy()
+                    cv2.putText(display,
+                                f"Next in {remaining:.1f}s",
+                                (10, display.shape[0] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (200, 200, 200), 1)
+
+                    if elapsed >= RESULT_DISPLAY_S:
+                        state = STATE_WAIT_RELEASE
+
+            elif state == STATE_WAIT_RELEASE:
+                # ── Wait for clamp to release before accepting next board ─
+                _, result_frame, _, status, color = last_result
+                display = result_frame.copy()
+                cv2.putText(display,
+                            "WAITING FOR CLAMP RELEASE...",
+                            (10, display.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 200, 255), 1)
+
+                # In sim mode, release on R key
+                if not GPIO_AVAILABLE:
+                    if key == ord('r'):
+                        clamp_active = False
+
+                if not clamp_active:
+                    print("🔓 Clamp released — ready for next board\n")
+                    last_result = None
+                    state       = STATE_STANDBY
+
+            cv2.imshow("PCB Inspection — PLC Mode", display)
+
+    except KeyboardInterrupt:
+        print("\nStopped by operator")
+
+    finally:
+        release_camera(camera, cam_type)
+        cv2.destroyAllWindows()
+        cleanup_gpio()   # fail-safe: this drops FAIL pin LOW → machine stops
+
+
+# ==============================================================================
+# IMAGE TEST MODES
+# ==============================================================================
+
+def test_on_image(image_path, calibration_mode=False):
+    frame = cv2.imread(image_path)
+    if frame is None:
+        print("❌ Could not load image:", image_path)
+        return
+
+    original_frame = frame.copy()
+    pin_count, output, results = check_pins_roi(frame, calibration_mode)
+
+    if pin_count == EXPECTED_HOLES:
+        status, color = "OK", (0, 255, 0)
+    else:
+        status, color = "ERROR", (0, 0, 255)
+        missing = [str(r[0]) for r in results if not r[2]]
+        log_error(f"[IMAGE] Pins: {pin_count}/6. Missing: {', '.join(missing)}")
+
+    output = draw_status(output, pin_count, status, color)
+    save_frame(original_frame, output, status, pin_count)
+    cv2.imshow("PCB Inspection — Image Test", output)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+def pick_image(multi=False):
+    Tk().withdraw()
+    if multi:
+        return filedialog.askopenfilenames(
+            title="Select PCB Images",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")]
+        )
+    return filedialog.askopenfilename(
+        title="Select PCB Image",
+        filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")]
+    )
+
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+if __name__ == "__main__":
+    load_calibration()
+
+    print("\n╔══════════════════════════════════════════╗")
+    print("║   PCB Pin Inspection System  v3 (PLC)   ║")
+    print("╠══════════════════════════════════════════╣")
+    print("║  1 → Calibrate (run this first)         ║")
+    print("║  2 → Test on Image                      ║")
+    print("║  3 → Test on Image (Debug)              ║")
+    print("║  4 → Camera — Manual (no PLC)           ║")
+    print("║  5 → Camera — PLC MODE  ← Production   ║")
+    print("║  6 → Camera — PLC MODE  (Debug)         ║")
+    print("╚══════════════════════════════════════════╝")
+
+    choice = input("\nEnter choice (1–6): ").strip()
+
+    if   choice == "1":              run_calibration()
+    elif choice in ("2", "3"):
+        path = pick_image()
+        if path: test_on_image(path, calibration_mode=(choice == "3"))
+    elif choice == "4":              run_camera_manual()
+    elif choice in ("5", "6"):       run_camera_plc(calibration_mode=(choice == "6"))
+    else:                            print("Invalid choice")
