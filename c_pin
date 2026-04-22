@@ -3,6 +3,7 @@ import numpy as np
 import time
 import os
 from tkinter import Tk, filedialog
+from picamera2 import Picamera2
 
 # ---------------------------
 # CONFIGURATION
@@ -879,6 +880,54 @@ def run_camera(calibration_mode=False):
         time.sleep(0.5)
 
     cap.release()
+    cv2.destroyAllWindows()
+
+def run_camera(calibration_mode=False):
+    picam2 = Picamera2()
+
+    # Configure camera
+    config = picam2.create_preview_configuration(
+        main={"format": "BGR888", "size": (640, 480)}
+    )
+    picam2.configure(config)
+
+    picam2.start()
+    time.sleep(2)  # Camera warm-up
+
+    print("Camera running. ESC = quit | c = toggle calibration mode")
+
+    while True:
+        frame = picam2.capture_array()
+
+        original_frame = frame.copy()
+        pin_count, output, results = check_pins_roi(frame, calibration_mode=calibration_mode)
+
+        if pin_count == EXPECTED_HOLES:
+            status = "OK"
+            color  = (0, 255, 0)
+        else:
+            status  = "ERROR"
+            color   = (0, 0, 255)
+            missing = [str(r[0]) for r in results if not r[2]]
+            log_error(f"Pins: {pin_count}/6. Missing at holes: {', '.join(missing)}")
+
+        output = draw_status(output, pin_count, status, color)
+
+        if not SAVE_ONLY_ON_ERROR or status == "ERROR":
+            save_frame(original_frame, output, status, pin_count)
+
+        cv2.imshow("PCB Pin Inspection", output)
+
+        key = cv2.waitKey(1)
+        if key == 27:
+            break
+        elif key == ord('c'):
+            calibration_mode = not calibration_mode
+            print(f"Calibration mode: {'ON' if calibration_mode else 'OFF'}")
+
+        time.sleep(0.5)
+
+    picam2.stop()
     cv2.destroyAllWindows()
 
 
