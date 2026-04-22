@@ -239,6 +239,58 @@ def run_camera():
     cap.release()
     cv2.destroyAllWindows()
 
+def run_camera():
+    picam2 = Picamera2()
+
+    config = picam2.create_preview_configuration(
+        main={"format": "BGR888", "size": (640, 480)}
+    )
+    picam2.configure(config)
+
+    picam2.start()
+    time.sleep(2)
+
+    while True:
+        frame = picam2.capture_array()
+
+        original_frame = frame.copy()
+
+        matched_count, output = check_holes_roi(frame)
+
+        if matched_count == EXPECTED_HOLES:
+            status = "OK"
+            color = (0, 255, 0)
+        else:
+            status = "ERROR"
+            color = (0, 0, 255)
+            log_error(f"Holes detected: {matched_count}/6")
+
+        cv2.putText(output, f"Status: {status}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    color,
+                    2)
+
+        cv2.putText(output, f"Matched: {matched_count}/6",
+                    (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2)
+
+        if not SAVE_ONLY_ON_ERROR or status == "ERROR":
+            save_frame(original_frame, output, status, matched_count)
+
+        cv2.imshow("PCB ROI Inspection", output)
+
+        if cv2.waitKey(1) == 27:
+            break
+
+        time.sleep(1)
+
+    picam2.stop()
+    cv2.destroyAllWindows()
 
 # ---------------------------
 # MAIN
