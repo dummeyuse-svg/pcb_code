@@ -3,6 +3,7 @@ import numpy as np
 import time
 import os
 from tkinter import Tk, filedialog
+from picamera2 import Picamera2
 
 # ---------------------------
 # CONFIGURATION
@@ -83,6 +84,7 @@ def calibrate_from_camera():
     global clicked_points
     clicked_points = []
 
+//from here
     cap = cv2.VideoCapture(0)
 
     print("\n🎥 Press 'c' to capture frame")
@@ -103,6 +105,35 @@ def calibrate_from_camera():
 
     cap.release()
     cv2.destroyAllWindows()
+to here 
+picam2 = Picamera2()
+
+config = picam2.create_preview_configuration(
+    main={"format": "BGR888", "size": (640, 480)}
+)
+picam2.configure(config)
+
+picam2.start()
+time.sleep(2)
+
+print("\n🎥 Press 'c' to capture frame")
+
+while True:
+    frame = picam2.capture_array()
+    cv2.imshow("Live Camera", frame)
+
+    key = cv2.waitKey(1)
+
+    if key == ord('c'):
+        captured = frame.copy()
+        break
+    elif key == 27:
+        picam2.stop()
+        cv2.destroyAllWindows()
+        return
+
+picam2.stop()
+cv2.destroyAllWindows()
 
     clone = captured.copy()
     cv2.namedWindow("Calibration")
@@ -213,12 +244,29 @@ def test_on_image(path):
 # ---------------------------
 
 def run_camera():
+
+fron here
     cap = cv2.VideoCapture(0)
 
     while True:
         ret, frame = cap.read()
         matched, output = check_holes_roi(frame)
 
+to here 
+
+picam2 = Picamera2()
+
+config = picam2.create_preview_configuration(
+    main={"format": "BGR888", "size": (640, 480)}
+)
+picam2.configure(config)
+
+picam2.start()
+time.sleep(2)
+
+while True:
+    frame = picam2.capture_array()
+    matched, output = check_holes_roi(frame)
         cv2.putText(output, f"Matched: {matched}/6",
                     (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX,
@@ -231,7 +279,7 @@ def run_camera():
         if cv2.waitKey(1) == 27:
             break
 
-    cap.release()
+    cap.release() replace with picam2.stop()
     cv2.destroyAllWindows()
 
 
